@@ -1,6 +1,5 @@
 #include <NanoESP.h>
 #include <NanoESP_HTTP.h>
-#include <NanoESP_MQTT.h>
 #include <Thread.h>
 #include "arduino_secrets.h"
 
@@ -27,13 +26,15 @@ const int PHOTORESISTOR_RESISTANCE = 10000;
 
 NanoESP _nanoesp = NanoESP();
 NanoESP_HTTP _http = NanoESP_HTTP(_nanoesp);
-NanoESP_MQTT _mqtt = NanoESP_MQTT(_nanoesp);
 Thread _wifiThread = Thread();
+Thread _mqttThread = Thread();
 Thread _sensorThread = Thread();
 Thread _publishThread = Thread();
 
 void connectWifi(int attempt = 1, int maxAttempts = 1);
 bool _mqttConnected = false;
+const long _mqttKeepAliveTime = 120; //seconds
+unsigned long _mqttPreviousMillisSend = 0;
 bool _firstSensorReading = true;
 int _temperatureData[NUM_SENSOR_SAMPLES];
 int _lightData[NUM_SENSOR_SAMPLES];
@@ -52,6 +53,8 @@ void setup() {
 
   _wifiThread.onRun(checkWifiConnection);
   _wifiThread.setInterval(30000);
+  _mqttThread.onRun(pingMqtt);
+  _mqttThread.setInterval((_mqttKeepAliveTime / 4) * 1000);
   _sensorThread.onRun(readSensorData);
   _sensorThread.setInterval(1000);
   _publishThread.onRun(publishSensorData);
@@ -69,17 +72,18 @@ void loop() {
   if (_wifiThread.shouldRun()) {
     _wifiThread.run(); //This will block everything if reconnecting isn't possible
   }
+  if (_mqttThread.shouldRun()) {
+    _mqttThread.run();
+  }
   if (_sensorThread.shouldRun()) {
     _sensorThread.run();
   }
   if (_publishThread.shouldRun()) {
     _publishThread.run();
   }
-  if (_mqttConnected) {
-    _mqtt.stayConnected(MQTT_CONNECTION_ID);
-  }
 
   processHttpRequest();
+  delay(500);
 }
 
 void checkWifiConnection() {
@@ -112,28 +116,11 @@ void connectWifi(int attempt, int maxAttempts) {
   }
 }
 
-void connectMqtt() {
-  Serial.println("Connecting to MQTT");
-  if (_nanoesp.wifiConnected()) {
-    _mqttConnected = _mqtt.connect(MQTT_CONNECTION_ID, SECRET_MQTT_BROKER, SECRET_MQTT_PORT, SECRET_MQTT_CLIENT,
-                                   SECRET_MQTT_USER, SECRET_MQTT_PASS);
-  }
-}
-
-void disconnectMqtt() {
-  Serial.println("Disconnecting from MQTT");
-  _mqtt.disconnect(MQTT_CONNECTION_ID);
-  _mqttConnected = false;
-}
-
 void readSensorData() {
   Serial.println("Reading data from sensors");
   _temperature = convertToTemperature(recalculateAverage(_temperatureData, analogRead(THERMISTOR_PIN)));
   _lightPercentage = convertToPercentage(recalculateAverage(_lightData, analogRead(PHOTORESISTOR_PIN)));
-  _rainPercentage = convertToPercentage(recalculateAverage(_rainData, analogRead(RAINSENSOR_PIN)));
-  Serial.println("Temperature: " + String(_temperature) + "C");
-  Serial.println("Light: " + String(_lightPercentage) + "%");
-  Serial.println("Rain: " + String(_rainPercentage) + "%");
+  _rainPercentage = convertToPercentage(recalculateAverage(_rainData, 1023 - analogRead(RAINSENSOR_PIN)));
   _firstSensorReading = false;
 }
 
@@ -176,23 +163,27 @@ void publishSensorData() {
 }
 
 void sendTopicData(String topic, String data) {
-  _mqtt.publish(MQTT_CONNECTION_ID, MQTT_ROOT_TOPIC + "/" + topic, data);
+  publishMqtt(MQTT_ROOT_TOPIC + "/" + topic, data);
 }
 
 void processHttpRequest() {
-  String method, resource, parameter, response;
+  String method, resource, parameter;
   int id;
 
   if (_http.recvRequest(id, method, resource, parameter)) { //Incoming request, parameters by reference
-    Serial.println("Received HTTP request");
+    Serial.println("Received HTTP request " + String(id));
     if (!isAllowedHttpRequest(method, resource)) {
-      response = "HTTP/1.1 403 Forbidden\r\n\r\n\n";
+      _nanoesp.sendData(id, "HTTP/1.1 403 Forbidden");
     } else {
-      response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"" + PUBLISH_NAME_TEMPERATURE +
-                 "\":" + _temperature + ",\"" + PUBLISH_NAME_LIGHT + "\":" + _lightPercentage + 
-                 ",\"" + PUBLISH_NAME_RAIN + "\":" + _rainPercentage + "}\n";
+      _nanoesp.sendData(id, "HTTP/1.1 200 OK");
+      _nanoesp.sendData(id, "Content-Type: application/json");
+      _nanoesp.sendData(id, "\r\n{");
+      _nanoesp.sendData(id, "\"" + PUBLISH_NAME_TEMPERATURE + "\":" + _temperature + ",");
+      _nanoesp.sendData(id, "\"" + PUBLISH_NAME_LIGHT + "\":" + _lightPercentage + ",");
+      _nanoesp.sendData(id, "\"" + PUBLISH_NAME_RAIN + "\":" + _rainPercentage);
+      _nanoesp.sendData(id, "}");
     }
-    _nanoesp.sendDataClose(id, response);
+    _nanoesp.closeConnection(id);
   }
 }
 
@@ -244,5 +235,184 @@ void morse(char character, int dotLength) {
 void setLedMode(int mode, int duration) {
   digitalWrite(LED_PIN, mode);
   delay(duration);
+}
+
+void connectMqtt() {
+  Serial.println("Connecting to MQTT");
+  _mqttConnected = false;
+  if (!_nanoesp.wifiConnected()) {
+    return;
+  }
+  
+  if (!_nanoesp.newConnection(MQTT_CONNECTION_ID, TCP, SECRET_MQTT_BROKER, SECRET_MQTT_PORT)) {
+    return;
+  }
+  
+  byte connectFlag = 0;
+  if (SECRET_MQTT_USER != "") connectFlag += 1;
+  connectFlag = connectFlag << 1;
+  if (SECRET_MQTT_PASS != "") connectFlag += 1;
+  connectFlag = connectFlag << 1;
+  connectFlag = connectFlag << 4;
+  connectFlag += true; //cleanSession
+  connectFlag = connectFlag << 1;
+
+  unsigned char data[]  = {
+    //Header (CONNECT BYTE, LEN)
+    0x10, 0x00,
+    //Variable Header
+    0x00, 0x04, 'M', 'Q', 'T', 'T', //String LEN (2BYTE) + Protocol name
+    0x04, //Protocol Level4
+    connectFlag, //Connect Flag (User Name, Password, Will Retain, Will QoS, Will flag, Clean Session, X)
+    0x00, _mqttKeepAliveTime, //Keep Alive Timer
+    //0x00, 0x00 //String Len UTF-8?
+  };//CONNEC message initialization,
+  //Then: ClientIdentifier, Will: Topic, Message, UserName, Password
+
+  int lenMsg = sizeof(data);
+  unsigned char vDeviceId[SECRET_MQTT_CLIENT.length() + 2];
+  utf8(SECRET_MQTT_CLIENT, vDeviceId);
+  lenMsg += sizeof(vDeviceId);
+
+  unsigned char vUserName[SECRET_MQTT_USER.length() + 2];
+  unsigned char vPassword[SECRET_MQTT_PASS.length() + 2];
+
+  if (SECRET_MQTT_USER != "") {
+    utf8(SECRET_MQTT_USER, vUserName);
+    utf8(SECRET_MQTT_PASS, vPassword);
+    lenMsg += sizeof(vUserName);
+    lenMsg += sizeof(vPassword);
+  }
+  //len MSG
+  data[1] = lenMsg - 2;
+
+  unsigned char msg [lenMsg];
+  int lenTemp = sizeof(data);
+  charAdd(data, lenTemp, vDeviceId, sizeof(vDeviceId), msg);
+  lenTemp += sizeof(vDeviceId);
+
+  if (SECRET_MQTT_USER != "") {
+    charAdd(msg, lenTemp, vUserName, sizeof(vUserName), msg);
+    lenTemp += sizeof(vUserName);
+    charAdd(msg, lenTemp, vPassword, sizeof(vPassword), msg);
+    lenTemp += sizeof(vPassword);
+  }
+
+  if (sendMqtt(msg, sizeof(msg), 2 << 4)) {
+    char buffer[2];
+    !_nanoesp.readBytes(buffer, 2); //After Header for ConnAck
+    if (buffer[1] != 0) {
+      Serial.print(F("Connection refused. Code: "));
+      Serial.println(buffer[1], HEX);
+    } else {
+      _mqttConnected = true;
+      Serial.println("Connected to MQTT");
+    }
+  }
+}
+
+void disconnectMqtt() {
+  Serial.println("Disconnecting from MQTT");
+  // Fixed Head,MS,LSB,    ,M,   Q       ?       ?   ?     ?  ,Ver X?,Conec,Kepp Alive tim
+  unsigned char data[]  = {
+    //Header
+    14 << 4, 0x00, //Publish
+  };
+  sendMqtt(data, sizeof(data));
+  _mqttConnected = false;
+}
+
+void pingMqtt() {
+  if (_mqttConnected) {
+    Serial.println("Sending MQTT ping");
+    // Fixed Head
+    unsigned char data[]  = {
+      //Header
+      12 << 4, 0x00, //Publish
+    };
+    sendMqtt(data, sizeof(data), 13 << 4);
+  }
+}
+
+void publishMqtt(const String& topic, const String& value) {
+  // Fixed Head
+  unsigned char data[]  = {
+    //Header
+    0x30, 0x00 //Publish
+  };
+  //MQTT_PUB .3 = DUP, .2.1 = QOS, .0 = RETAIN
+  data[0] += 0 << 1;
+  data[0] += 0;
+
+  unsigned char vTopic[topic.length() + 2];
+  utf8(topic, vTopic);
+  int lenMsg  = sizeof(data) + sizeof(vTopic) + value.length();
+  unsigned char vmsg [lenMsg];
+  int lenTemp = sizeof(data);
+  charAdd(data, lenTemp, vTopic, sizeof(vTopic), vmsg);
+  lenTemp += sizeof(vTopic);
+
+  for (int i = 0; i < value.length(); i++) {
+    vmsg[i + lenTemp] = value[i];
+  }
+  vmsg[1] = lenMsg - 2;
+
+  sendMqtt(vmsg, sizeof(vmsg));
+}
+
+bool sendMqtt(unsigned char data[], int LenChar) {
+  data[1] = LenChar - 2; //Header Len
+  _nanoesp.println("AT+CIPSEND=" + String(MQTT_CONNECTION_ID) + "," + String(LenChar));
+  if (_nanoesp.find(">")) {
+    for (int i = 0; i < LenChar; i++) {
+      _nanoesp.write(data[i]);
+    }
+    if (_nanoesp.find("OK\r\n")) {
+      _mqttPreviousMillisSend = millis(); //Reset time till ping
+      return true; //Short it
+    }
+  }
+  return false;
+}
+
+bool sendMqtt(unsigned char data[], int LenChar, char ack) {
+  data[1] = LenChar - 2; //Header Len
+  _nanoesp.println("AT+CIPSEND=" + String(MQTT_CONNECTION_ID) + "," + String(LenChar));
+  if (_nanoesp.find(">")) {
+    for (int i = 0; i < LenChar; i++) {
+      _nanoesp.write(data[i]);
+    }
+    if (_nanoesp.find("OK\r\n")) {
+      _mqttPreviousMillisSend = millis(); //Reset time till ping
+      _nanoesp.find("+IPD");
+      _nanoesp.find(":");
+
+      //Get ACK Header
+      char buffer[2] ; //Header should be 2!!! 
+      _nanoesp.readBytes(buffer, 2);
+      if (buffer[0] == ack) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void utf8(const String& input, unsigned char* output) {
+  byte len = input.length();
+  output[0] = 0;
+  output[1] = len;
+  for (int i = 0; i < len ; i++) {
+    output[i + 2] = input[i];
+  }
+}
+
+void charAdd(unsigned char* inputA, int lenA, unsigned char* inputB, int lenB, unsigned char* output) {
+  for (int i = 0; i < lenA; i++) {
+    output[i] = inputA[i];
+  }
+  for (int i = 0; i < lenB; i++) {
+    output[i + lenA] = inputB[i];
+  }
 }
 
