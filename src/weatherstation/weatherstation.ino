@@ -6,7 +6,7 @@
 const int WIFI_RECONNECT_ATTEMPTS = 10;
 const int WIFI_RECONNECT_BACKOFF = 15; //seconds
 const int MQTT_CONNECTION_ID = 0;
-const long MQTT_PUBLISH_INTERVAL = 120; //seconds
+const int MQTT_PUBLISH_INTERVAL = 30; //seconds
 const String MQTT_ROOT_TOPIC = "weatherstation";
 const int HTTP_SERVER_PORT = 80;
 const String HTTP_DATA_PATH = "/data";
@@ -16,8 +16,8 @@ const String PUBLISH_NAME_RAIN = "rain";
 
 const uint8_t LED_PIN = 10;
 const uint8_t THERMISTOR_PIN = A6;
-const uint8_t PHOTORESISTOR_PIN = A1;
-const uint8_t RAINSENSOR_PIN = A2;
+const uint8_t PHOTORESISTOR_PIN = A7;
+const uint8_t RAINSENSOR_PIN = A0;
 
 const int NUM_SENSOR_SAMPLES = 30;
 const int THERMISTOR_RESISTANCE = 10000;
